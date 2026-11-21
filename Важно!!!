@@ -4,6 +4,7 @@ commands.py (команды и действия), groups.py (группы из �
 Настройка ПО и vosk: https://habr.com/ru/companies/timeweb/articles/817929/
 
 Версия операционки Raspbian OS: trixie 64-bit
+vosk-model-small-ru-0.22
 
 
 apt install apache2 curl git samba samba-client python3-pip python3-venv aptitude libffi-dev cmake build-essential libssl-dev libportaudio2 libsndfile1 ffmpeg mosquitto certbot nodejs make g++ gcc libsystemd-dev sox
