@@ -1,7 +1,5 @@
 Используются файлы - main_y2m.py (основной скрипт), config.js (конфиг от yandex2mqtt, содержит оборудование и инстансы),
 commands.py (команды и действия), groups.py (группы из устройств) и файл настроек settings.ini.
-Как настраивать микрофон взял отсюда: https://habr.com/ru/companies/timeweb/articles/772080
-Настройка ПО и vosk: https://habr.com/ru/companies/timeweb/articles/817929/
 
 Версия операционки Raspbian OS: trixie 64-bit
 vosk-model-small-ru-0.22
