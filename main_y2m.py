@@ -52,45 +52,49 @@ def log(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
 
+# --- технические константы (не конфиг) ---
 MIN_COMMAND_LENGTH = 2
+SAMPLERATE_VOSK = 16000
+LEVEL_INSTANCES = ('brightness', 'temperature', 'volume', 'humidity', 'position')
+SEEED_KEYWORDS = ('MicArray', 'reSpeaker', 'XVF3800', 'Array')
 
-DEDUP_WINDOW = 4.0
-DEDUP_FUZZ = 85
-last_command = {'cmd': '', 'time': 0.0}
+# --- runtime-состояние ---
+last_command = {'cmd': '', 'mic_id': None, 'time': 0.0}
 dedup_lock = threading.Lock()
 
 command_mode = False
 command_timer = None
 command_mode_lock = threading.Lock()
 
-SAMPLERATE_VOSK = 16000
-
-SEEED_KEYWORDS = ('MicArray', 'reSpeaker', 'XVF3800', 'Array')
-
-SLOT_STALL_SEC = 10.0
 _last_blocks = {}
-
-ARECORD_RESTART_WARN_SEC = 30.0
-ARECORD_MISSING_DEV_WAIT_SEC = 5.0
-
-LEVEL_LOG_INTERVAL = 1.0
 _last_level_log = {}
-
-GAIN_TARGET = 12000
-GAIN_MAX = 50
-GAIN_MIN = 1
-GAIN_SMOOTHING = 0.7
-GAIN_SPEECH_THRESHOLD = 200
-
 _subscribed_topics = []
 
 device_states = {}
 device_states_lock = threading.Lock()
 
-LEVEL_INSTANCES = ('brightness', 'temperature', 'volume', 'humidity', 'position')
+# --- выводим из commands.py ---
+LEVEL_UP_WORDS = tuple()
+LEVEL_DOWN_WORDS = tuple()
+for _syn, _val in COMMANDS_LEVEL.items():
+    if _val == 'UP':
+        LEVEL_UP_WORDS = _syn
+    elif _val == 'DOWN':
+        LEVEL_DOWN_WORDS = _syn
 
-LEVEL_UP_WORDS = ('ярче', 'светлее', 'теплее', 'выше', 'громче', 'больше', 'сильнее')
-LEVEL_DOWN_WORDS = ('тусклее', 'темнее', 'холоднее', 'ниже', 'тише', 'меньше', 'слабее')
+# ==================== ЧИСЛИТЕЛЬНЫЕ ====================
+
+NUM_WORDS = {
+    'ноль': 0, 'один': 1, 'два': 2, 'три': 3, 'четыре': 4,
+    'пять': 5, 'шесть': 6, 'семь': 7, 'восемь': 8, 'девять': 9,
+    'десять': 10, 'одиннадцать': 11, 'двенадцать': 12,
+    'тринадцать': 13, 'четырнадцать': 14, 'пятнадцать': 15,
+    'шестнадцать': 16, 'семнадцать': 17, 'восемнадцать': 18,
+    'девятнадцать': 19, 'двадцать': 20, 'тридцать': 30,
+    'сорок': 40, 'пятьдесят': 50, 'шестьдесят': 60,
+    'семьдесят': 70, 'восемьдесят': 80, 'девяносто': 90,
+    'сто': 100,
+}
 
 # ==================== АВТООПРЕДЕЛЕНИЕ ====================
 
@@ -462,7 +466,7 @@ except Exception as e:
     log(f"❌ MQTT connect: {e}")
 
 
-def publish_command(topic, value, description=""):
+def publish_command(topic, value, description="", state_topic=None):
     if not mqtt_client:
         log(f"❌ MQTT клиент не инициализирован: {topic}={value}")
         return False
@@ -472,6 +476,13 @@ def publish_command(topic, value, description=""):
             log(f"❌ Ошибка публикации {topic}={value}: rc={result.rc}")
             return False
         log(f"✅ {description}{topic} = {value}")
+        try:
+            int(float(value))
+            target = state_topic or topic
+            with device_states_lock:
+                device_states[target] = str(value)
+        except (ValueError, TypeError):
+            pass
         return True
     except Exception as e:
         log(f"❌ Публикация {topic}={value}: {e}")
@@ -519,6 +530,15 @@ def build_vosk_vocabulary():
             w = word.strip('.,!?-()')
             if len(w) > 1 and w.isalpha():
                 vocabulary.add(w)
+
+    for n in range(0, 101):
+        vocabulary.add(str(n))
+    for w in NUM_WORDS.keys():
+        vocabulary.add(w)
+    for w in ('процент', 'процента', 'процентов',
+              'градус', 'градуса', 'градусов'):
+        vocabulary.add(w)
+
     vocabulary.add("[unk]")
     result = sorted(vocabulary)
     log(f"📚 Собрано {len(result)} слов")
@@ -570,42 +590,58 @@ def strip_wake_word(text):
         if alias in cmd:
             cmd = cmd.replace(alias, ' ')
             found = True
+    cmd = cmd.replace('[unk]', ' ')
     cmd = re.sub(r'\s+', ' ', cmd).strip(' .,!?-').strip()
     return cmd, found
 
 
-def is_duplicate_command(cmd):
+def is_duplicate_command(cmd, mic_id=None):
     if not cmd:
-        return False
+        return False, None, None
     now = time.time()
     with dedup_lock:
         prev = last_command['cmd']
+        prev_mic = last_command['mic_id']
         prev_time = last_command['time']
-        if prev and now - prev_time < DEDUP_WINDOW:
+
+        if (prev and
+                now - prev_time < DEDUP_WINDOW and
+                prev_mic is not None and
+                mic_id is not None and
+                prev_mic != mic_id):
             score = fuzz.token_set_ratio(prev, cmd)
             if score >= DEDUP_FUZZ:
                 return True, prev, score
+
         last_command['cmd'] = cmd
+        last_command['mic_id'] = mic_id
         last_command['time'] = now
     return False, None, None
 
 
+def parse_number(cmd_lower):
+    m = re.search(r'(\d{1,3})', cmd_lower)
+    if m:
+        return int(m.group(1))
+    words = cmd_lower.split()
+    total = 0
+    found = False
+    for w in words:
+        w = w.strip('.,!?-')
+        if w in NUM_WORDS:
+            total += NUM_WORDS[w]
+            found = True
+    return total if found else None
+
+
 def resolve_level_value(cmd_lower, spec, current_value=None):
-    """
-    spec: {'min': 0, 'max': 100, 'step': 10, 'instance': 'brightness'}
-    Возвращает строку-значение для publish или None.
-    - число в команде → ограничить [min,max], округлить до step
-    - 'UP'  → current + step (или 'UP', если current неизвестен)
-    - 'DOWN'→ current - step (или 'DOWN')
-    """
     lo = spec.get('min', 0)
     hi = spec.get('max', 100)
     step = spec.get('step', 1) or 1
 
-    m = re.search(r'(\d{1,3})', cmd_lower)
-    if m:
-        v = int(m.group(1))
-        v = max(lo, min(hi, v))
+    num = parse_number(cmd_lower)
+    if num is not None:
+        v = max(lo, min(hi, num))
         if step > 0:
             v = lo + ((v - lo) // step) * step
         return str(v)
@@ -658,7 +694,7 @@ def _current_level_value(device, cmd_topic):
 def execute_command(command):
     cmd_lower = command.lower().strip()
     if len(cmd_lower) < MIN_COMMAND_LENGTH:
-        return None, None, None, None
+        return None, None, None, None, None
     best_overall = None
     best_overall_score = 0
     for device in devices.values():
@@ -670,6 +706,20 @@ def execute_command(command):
         for cmd_topic, cmd_options in device.commands.items():
             if not isinstance(cmd_options, dict):
                 continue
+
+            state_topic = device.level_states.get(cmd_topic)
+
+            if cmd_topic in device.level_specs:
+                spec = device.level_specs[cmd_topic]
+                current = _current_level_value(device, cmd_topic)
+                new_val = resolve_level_value(cmd_lower, spec, current)
+                if new_val is not None:
+                    score = 90
+                    if score > best_score:
+                        best_score = score
+                        best_result = (dev_name, dev_location, cmd_topic, new_val, state_topic)
+                    continue
+
             for synonyms_tuple, action_value in cmd_options.items():
                 for synonym in synonyms_tuple:
                     s = synonym.lower()
@@ -677,19 +727,12 @@ def execute_command(command):
                                 fuzz.partial_ratio(s, cmd_lower),
                                 fuzz.token_set_ratio(s, cmd_lower))
                     if score >= SIM_ACTION and score > best_score:
-                        final_value = action_value
-                        if cmd_topic in device.level_specs:
-                            spec = device.level_specs[cmd_topic]
-                            current = _current_level_value(device, cmd_topic)
-                            new_val = resolve_level_value(cmd_lower, spec, current)
-                            if new_val is not None:
-                                final_value = new_val
                         best_score = score
-                        best_result = (dev_name, dev_location, cmd_topic, final_value)
+                        best_result = (dev_name, dev_location, cmd_topic, action_value, state_topic)
         if best_result and best_score > best_overall_score:
             best_overall_score = best_score
             best_overall = best_result
-    return best_overall if best_overall else (None, None, None, None)
+    return best_overall if best_overall else (None, None, None, None, None)
 
 
 def find_action_in_command(cmd_lower):
@@ -743,6 +786,7 @@ def execute_group_command(command):
             for synonyms_tuple, action_value in cmd_options.items():
                 if action_value == action:
                     final_value = action_value
+                    state_topic = device.level_states.get(cmd_topic)
                     if cmd_topic in device.level_specs:
                         spec = device.level_specs[cmd_topic]
                         current = _current_level_value(device, cmd_topic)
@@ -752,7 +796,9 @@ def execute_group_command(command):
                     loc_str = ""
                     if device.room and not room_in_name(device.room, device.name):
                         loc_str = f" {device.room.upper()}"
-                    if publish_command(cmd_topic, final_value, f"{device_id}{loc_str}: "):
+                    if publish_command(cmd_topic, final_value,
+                                       f"{device_id}{loc_str}: ",
+                                       state_topic=state_topic):
                         success = True
                     found = True
                     break
@@ -765,12 +811,13 @@ def process_command(command):
     if len(command.strip()) < MIN_COMMAND_LENGTH:
         return
     log(f"🎯 ВЫПОЛНЕНА КОМАНДА: '{command}'")
-    dev_name, location, topic, action = execute_command(command)
-    if dev_name and topic and action:
+    result = execute_command(command)
+    if result and result[0]:
+        dev_name, location, topic, action, state_topic = result
         loc_str = ""
         if location and not room_in_name(location, dev_name):
             loc_str = f" {location.upper()}"
-        if publish_command(topic, action, f"{dev_name}{loc_str}: "):
+        if publish_command(topic, action, f"{dev_name}{loc_str}: ", state_topic=state_topic):
             play_sound(SOUND_COMMAND_DONE)
             return
         play_sound(SOUND_COMMAND_END)
@@ -802,7 +849,7 @@ def process_text(text, mic_id=None):
     wake_detected, wake_type = is_wake_word(text)
 
     if cmd and wake_detected:
-        dup, prev, score = is_duplicate_command(cmd)
+        dup, prev, score = is_duplicate_command(cmd, mic_id)
         if dup:
             log(f"   🔁 Дубликат команды от mic{mic_id} "
                 f"(fuzz {score:.1f}, prev='{prev}'), игнорируем")
@@ -1271,7 +1318,7 @@ def voice_listener():
             f"👋 Wake: {wake_list}\n"
             f"📱 Устройств: {len(devices)}\n"
             f"👥 Групп: {len(groups)}\n"
-            f"🔁 Дедуп: {DEDUP_WINDOW}с, fuzz>={DEDUP_FUZZ} (только с wake)\n"
+            f"🔁 Дедуп: {DEDUP_WINDOW}с, fuzz>={DEDUP_FUZZ} (только между микрофонами)\n"
             f"🩺 Watchdog: blocks не растут {SLOT_STALL_SEC}с → рестарт\n"
             f"🔁 arecord restart warn: раз в {ARECORD_RESTART_WARN_SEC:.0f}с\n"
             + "=" * 60 + "\n"
